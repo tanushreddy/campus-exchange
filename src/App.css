@@ -1,0 +1,370 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
+
+/**
+ * CAMPUS EXCHANGE – 5-HOUR MVP
+ * Stack: Supabase (Auth + DB + Storage) + React (PWA-friendly) – mobile-first UI
+ * How to run locally (quick):
+ * 1) Create a new Vite + React app or use this canvas preview. In Vite: `npm create vite@latest campus-exchange -- --template react` then `cd campus-exchange && npm i @supabase/supabase-js`
+ * 2) In Supabase project settings, copy your URL and anon key and paste them below.
+ * 3) In Supabase SQL editor, run the schema from the README section in chat (included below this code) to create tables + RLS.
+ * 4) Start dev server: `npm run dev`. For a quick deploy, push to GitHub and connect Vercel (free).
+ * 5) University-only: set allowed email domain(s) in Supabase Auth → Email Auth → Allow list (e.g., woxsen.edu). Or use the trigger shown in the schema.
+ */
+
+// ======== 🔧 CONFIG – PASTE YOUR SUPABASE CREDS ========
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "https://YOUR-PROJECT.supabase.co";
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "YOUR-ANON-KEY";
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// Simple helpers
+function classNames(...xs) { return xs.filter(Boolean).join(" "); }
+
+const categories = [
+  "Books", "Electronics", "Lab Coats", "Stationery", "Hostel", "Sports", "Other"
+];
+
+const intents = [
+  { key: "resale", label: "Resale" },
+  { key: "barter", label: "Barter" },
+  { key: "donation", label: "Donation" },
+];
+
+const POINT_RULES = {
+  LIST_ITEM: 5,
+  COMPLETE_TRADE: 20,
+  DONATION_BONUS: 15,
+  CLAIM_MYSTERY: -10,
+};
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [items, setItems] = useState([]);
+  const [tab, setTab] = useState("market"); // market | my | mystery | leaderboard
+  const [form, setForm] = useState({
+    title: "",
+    description: "",
+    category: "Books",
+    intent: "resale",
+    price: "",
+    imageFile: null,
+  });
+  const [filter, setFilter] = useState({ search: "", category: "All", intent: "All" });
+  const [mysteryBoxes, setMysteryBoxes] = useState([]);
+  const [leaders, setLeaders] = useState([]);
+
+  // ===== Auth boot =====
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user ?? null);
+      setSessionChecked(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  // ===== Data fetchers =====
+  const fetchItems = async () => {
+    setLoading(true);
+    let query = supabase
+      .from("items")
+      .select("id, title, description, category, intent, price, owner_id, created_at, image_url, status")
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (filter.category !== "All") query = query.eq("category", filter.category);
+    if (filter.intent !== "All") query = query.eq("intent", filter.intent);
+    if (filter.search) query = query.ilike("title", `%${filter.search}%`);
+
+    const { data, error } = await query;
+    if (!error) setItems(data || []);
+    setLoading(false);
+  };
+
+  const fetchMystery = async () => {
+    const { data, error } = await supabase
+      .from("mystery_boxes")
+      .select("id, title, description, points_cost, claimed_by, created_at")
+      .is("claimed_by", null)
+      .order("created_at", { ascending: false });
+    if (!error) setMysteryBoxes(data || []);
+  };
+
+  const fetchLeaderboard = async () => {
+    const { data, error } = await supabase.rpc("get_leaderboard");
+    if (!error) setLeaders(data || []);
+  };
+
+  useEffect(() => { fetchItems(); }, [filter.category, filter.intent]);
+  useEffect(() => { fetchMystery(); fetchLeaderboard(); }, [user]);
+
+  // ===== Actions =====
+  const signIn = async (email) => {
+    setLoading(true);
+    const { error } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.origin } });
+    setLoading(false);
+    if (error) alert(error.message);
+    else alert("Check your email for the magic link (university domain only).");
+  };
+
+  const signOut = async () => { await supabase.auth.signOut(); };
+
+  const handleUpload = async (file) => {
+    if (!file) return null;
+    const ext = file.name.split(".").pop();
+    const path = `${user.id}/${Date.now()}.${ext}`;
+    const { data, error } = await supabase.storage.from("item-images").upload(path, file);
+    if (error) { alert(error.message); return null; }
+    const { data: pub } = supabase.storage.from("item-images").getPublicUrl(path);
+    return pub?.publicUrl || null;
+  };
+
+  const createItem = async (e) => {
+    e.preventDefault();
+    if (!user) return alert("Please sign in first.");
+    setLoading(true);
+    let image_url = null;
+    if (form.imageFile) image_url = await handleUpload(form.imageFile);
+
+    const payload = {
+      title: form.title.trim(),
+      description: form.description.trim(),
+      category: form.category,
+      intent: form.intent,
+      price: form.intent === "resale" ? Number(form.price || 0) : null,
+      owner_id: user.id,
+      image_url,
+      status: "active",
+    };
+    const { data, error } = await supabase.from("items").insert(payload).select();
+    setLoading(false);
+    if (error) return alert(error.message);
+    setForm({ title: "", description: "", category: "Books", intent: "resale", price: "", imageFile: null });
+    fetchItems();
+    // award points for listing
+    await supabase.rpc("award_points", { p_user_id: user.id, p_points: POINT_RULES.LIST_ITEM, p_reason: "Listed an item" });
+  };
+
+  const makeOffer = async (itemId, type = "barter") => {
+    if (!user) return alert("Sign in to make an offer.");
+    const note = prompt(type === "barter" ? "Describe what you will exchange:" : "Add a short note to seller:");
+    const payload = { item_id: itemId, type, note, offered_by: user.id };
+    const { error } = await supabase.from("offers").insert(payload);
+    if (error) return alert(error.message);
+    alert("Offer sent!");
+  };
+
+  const markCompleted = async (itemId, kind = "trade") => {
+    // Owner can mark an item as completed → awards points
+    const { error } = await supabase.from("items").update({ status: "completed" }).eq("id", itemId).eq("owner_id", user.id);
+    if (error) return alert(error.message);
+    fetchItems();
+    // award points
+    const bonus = kind === "donation" ? POINT_RULES.DONATION_BONUS : POINT_RULES.COMPLETE_TRADE;
+    await supabase.rpc("award_points", { p_user_id: user.id, p_points: bonus, p_reason: kind === "donation" ? "Donation completed" : "Trade completed" });
+    alert("Marked completed & points awarded.");
+  };
+
+  const claimMystery = async (boxId) => {
+    if (!user) return alert("Sign in to claim.");
+    const { data: balance } = await supabase.rpc("get_points", { p_user_id: user.id });
+    const box = mysteryBoxes.find(b => b.id === boxId);
+    if (!box) return;
+    if ((balance?.points || 0) < box.points_cost) return alert("Not enough points to claim.");
+    const { error } = await supabase.rpc("claim_mystery_box", { p_box_id: boxId });
+    if (error) return alert(error.message);
+    await supabase.rpc("award_points", { p_user_id: user.id, p_points: POINT_RULES.CLAIM_MYSTERY, p_reason: "Claimed mystery box" });
+    fetchMystery();
+    alert("Mystery box claimed! Collect it from the Sustainability Desk.");
+  };
+
+  // ===== UI =====
+  if (!sessionChecked) return <div className="p-6">Loading…</div>;
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-900">
+      <header className="sticky top-0 z-10 bg-white/80 backdrop-blur border-b">
+        <div className="max-w-5xl mx-auto p-4 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="text-2xl font-bold">♻️ Campus Exchange</span>
+            <span className="hidden sm:inline text-xs px-2 py-1 rounded-full bg-emerald-100 text-emerald-700">Resale · Barter · Donation</span>
+          </div>
+          <div className="flex items-center gap-3">
+            {user ? (
+              <>
+                <span className="text-sm">Hi, {user.email}</span>
+                <button className="px-3 py-1.5 rounded-xl bg-gray-900 text-white" onClick={signOut}>Sign out</button>
+              </>
+            ) : (
+              <EmailLogin onSubmit={signIn} />
+            )}
+          </div>
+        </div>
+        <nav className="max-w-5xl mx-auto px-4 pb-3 flex gap-2">
+          {[
+            ["market", "Marketplace"],
+            ["my", "Post Item"],
+            ["mystery", "🎁 Mystery Box"],
+            ["leaderboard", "🏆 Leaderboard"],
+          ].map(([key, label]) => (
+            <button key={key} onClick={() => setTab(key)} className={classNames("px-3 py-2 rounded-xl text-sm", tab===key?"bg-gray-900 text-white":"bg-gray-200")}>
+              {label}
+            </button>
+          ))}
+        </nav>
+      </header>
+
+      <main className="max-w-5xl mx-auto p-4">
+        {tab === "market" && (
+          <section>
+            <Filters filter={filter} setFilter={setFilter} />
+            <div className="mt-4 grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {loading ? (<div>Loading items…</div>) : items.length === 0 ? (
+                <EmptyState />
+              ) : items.map(it => (
+                <article key={it.id} className="bg-white rounded-2xl shadow p-3 flex flex-col">
+                  {it.image_url ? (
+                    <img src={it.image_url} alt={it.title} className="h-40 w-full object-cover rounded-xl" />
+                  ) : (
+                    <div className="h-40 rounded-xl bg-gray-100 flex items-center justify-center text-4xl">📦</div>
+                  )}
+                  <div className="mt-3">
+                    <h3 className="font-semibold text-lg">{it.title}</h3>
+                    <p className="text-sm text-gray-600 line-clamp-2">{it.description}</p>
+                    <div className="mt-2 flex items-center gap-2 text-xs">
+                      <span className="px-2 py-1 rounded-full bg-gray-100">{it.category}</span>
+                      <span className="px-2 py-1 rounded-full bg-blue-100">{it.intent}</span>
+                      {it.price != null && <span className="px-2 py-1 rounded-full bg-emerald-100">₹{it.price}</span>}
+                    </div>
+                  </div>
+                  <div className="mt-3 grid grid-cols-3 gap-2">
+                    <button className="px-3 py-2 rounded-xl bg-emerald-600 text-white" onClick={() => makeOffer(it.id, "barter")}>Barter</button>
+                    {it.intent === "resale" && (
+                      <button className="px-3 py-2 rounded-xl bg-indigo-600 text-white" onClick={() => makeOffer(it.id, "buy")}>Buy</button>
+                    )}
+                    <button className="px-3 py-2 rounded-xl bg-gray-200" onClick={() => makeOffer(it.id, "message")}>Message</button>
+                  </div>
+                  {user?.id === it.owner_id && (
+                    <div className="mt-2">
+                      <button className="w-full px-3 py-2 rounded-xl bg-gray-900 text-white" onClick={() => markCompleted(it.id, it.intent === "donation" ? "donation" : "trade")}>Mark Completed</button>
+                    </div>
+                  )}
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {tab === "my" && (
+          <section className="max-w-xl">
+            <h2 className="text-xl font-semibold mb-3">Post an item</h2>
+            <form onSubmit={createItem} className="space-y-3">
+              <input className="w-full px-3 py-2 rounded-xl bg-white border" placeholder="Title" value={form.title} onChange={(e)=>setForm(v=>({...v,title:e.target.value}))} required />
+              <textarea className="w-full px-3 py-2 rounded-xl bg-white border" placeholder="Description" value={form.description} onChange={(e)=>setForm(v=>({...v,description:e.target.value}))} required />
+              <div className="grid grid-cols-2 gap-2">
+                <select className="px-3 py-2 rounded-xl bg-white border" value={form.category} onChange={(e)=>setForm(v=>({...v,category:e.target.value}))}>
+                  {categories.map(c => <option key={c}>{c}</option>)}
+                </select>
+                <select className="px-3 py-2 rounded-xl bg-white border" value={form.intent} onChange={(e)=>setForm(v=>({...v,intent:e.target.value}))}>
+                  {intents.map(i => <option key={i.key} value={i.key}>{i.label}</option>)}
+                </select>
+              </div>
+              {form.intent === "resale" && (
+                <input type="number" min="0" className="w-full px-3 py-2 rounded-xl bg-white border" placeholder="Price (₹)" value={form.price} onChange={(e)=>setForm(v=>({...v,price:e.target.value}))} />
+              )}
+              <input type="file" accept="image/*" onChange={(e)=>setForm(v=>({...v,imageFile:e.target.files?.[0]||null}))} />
+              <button disabled={loading} className="w-full px-3 py-2 rounded-xl bg-gray-900 text-white">{loading?"Posting…":"Post Item"}</button>
+            </form>
+          </section>
+        )}
+
+        {tab === "mystery" && (
+          <section>
+            <h2 className="text-xl font-semibold mb-3">🎁 Mystery Box</h2>
+            <p className="text-sm text-gray-600">Spend points to claim surprise items donated for recycling/reuse. Limited stock.</p>
+            <div className="mt-3 grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {mysteryBoxes.length===0 ? (
+                <div className="text-gray-600">No boxes right now. Check back later.</div>
+              ) : mysteryBoxes.map(b => (
+                <article key={b.id} className="bg-white rounded-2xl shadow p-3">
+                  <h3 className="font-semibold">{b.title}</h3>
+                  <p className="text-sm text-gray-600">{b.description}</p>
+                  <div className="mt-2 text-xs px-2 py-1 rounded-full bg-amber-100 inline-block">Cost: {b.points_cost} pts</div>
+                  <button className="mt-3 w-full px-3 py-2 rounded-xl bg-amber-600 text-white" onClick={()=>claimMystery(b.id)}>Claim</button>
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {tab === "leaderboard" && (
+          <section>
+            <h2 className="text-xl font-semibold mb-3">🏆 Sustainability Leaderboard</h2>
+            <div className="overflow-x-auto">
+              <table className="min-w-full bg-white rounded-2xl shadow">
+                <thead>
+                  <tr className="text-left text-sm">
+                    <th className="p-3">Rank</th>
+                    <th className="p-3">User</th>
+                    <th className="p-3">Points</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {leaders.map((row, idx) => (
+                    <tr key={row.user_id} className="border-t">
+                      <td className="p-3">{idx+1}</td>
+                      <td className="p-3">{row.email}</td>
+                      <td className="p-3">{row.points}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+      </main>
+
+      <footer className="max-w-5xl mx-auto p-4 text-xs text-gray-500">
+        <p>Built for campus reuse: resale · barter · donation · bounty · mystery box. Secure, university-only network.</p>
+      </footer>
+    </div>
+  );
+}
+
+function EmailLogin({ onSubmit }) {
+  const [email, setEmail] = useState("");
+  return (
+    <form onSubmit={(e)=>{e.preventDefault(); onSubmit(email);}} className="flex gap-2">
+      <input type="email" required placeholder="your-id@university.edu" value={email} onChange={(e)=>setEmail(e.target.value)} className="px-3 py-2 rounded-xl border" />
+      <button className="px-3 py-2 rounded-xl bg-gray-900 text-white">Get Link</button>
+    </form>
+  );
+}
+
+function Filters({ filter, setFilter }) {
+  return (
+    <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
+      <input className="px-3 py-2 rounded-xl bg-white border flex-1" placeholder="Search items…" value={filter.search} onChange={(e)=>setFilter(v=>({...v,search:e.target.value}))} />
+      <select className="px-3 py-2 rounded-xl bg-white border" value={filter.category} onChange={(e)=>setFilter(v=>({...v,category:e.target.value}))}>
+        {['All', ...categories].map(c => <option key={c}>{c}</option>)}
+      </select>
+      <select className="px-3 py-2 rounded-xl bg-white border" value={filter.intent} onChange={(e)=>setFilter(v=>({...v,intent:e.target.value}))}>
+        {['All', ...intents.map(i=>i.key)].map(c => <option key={c} value={c}>{c}</option>)}
+      </select>
+    </div>
+  );
+}
+
+function EmptyState(){
+  return (
+    <div className="col-span-full text-center py-12 bg-white rounded-2xl shadow">
+      <div className="text-5xl">🗃️</div>
+      <p className="mt-2 text-gray-700">No items yet. Be the first to list something!</p>
+    </div>
+  );
+}
