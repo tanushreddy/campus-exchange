@@ -10,6 +10,11 @@ export default function Login() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!email.endsWith("@woxsen.edu.in")) {
+      alert("Please use your university email ID");
+      return;
+    }
+
     if (mode === "login") {
       const { error } = await supabase.auth.signInWithPassword({ email, password });
       if (error) return alert(error.message);

@@ -18,17 +18,22 @@ export default function App() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    async function init() {
-      const { data: session } = await supabase.auth.getSession();
-      if (!session?.session) {
-        navigate("/login");
-        return;
+    const { data: authListener } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        if (!session) {
+          navigate("/login");
+        } else {
+          setUser(session.user);
+          fetchItems(session.user);
+        }
       }
-      setUser(session.session.user);
-      fetchItems(session.session.user);
-    }
-    init();
+    );
+
+    return () => {
+      authListener.subscription.unsubscribe();
+    };
   }, []);
+
 
   const fetchItems = async (currentUser) => {
     const { data, error } = await supabase
@@ -53,32 +58,63 @@ export default function App() {
   };
 
   const fetchRequests = async (allItems, currentUser) => {
-    const { data: myReqs } = await supabase
+    const { data: myReqs, error: myReqError } = await supabase
       .from("requests")
-      .select("id, status, item_id, buyer_id, items!inner(id,title,price,owner_id)")
+      .select(
+        "id, status, item_id, buyer_id, items!inner(id,title,price,owner_id)"
+      )
       .eq("buyer_id", currentUser.id);
 
-    const { data: incoming } = await supabase
-      .from("requests")
-      .select("id, status, buyer_id, item_id, items!inner(id,title,price,owner_id)")
-      .in(
-        "item_id",
-        allItems.filter((i) => i.owner_id === currentUser.id).map((i) => i.id)
-      );
+    if (myReqError) {
+      console.error("My requests error:", myReqError);
+    }
+
+    const myItemIds = allItems
+      .filter((i) => i.owner_id === currentUser.id)
+      .map((i) => i.id);
+
+    let incoming = [];
+
+    if (myItemIds.length > 0) {
+      const { data, error } = await supabase
+        .from("requests")
+        .select(
+          "id, status, buyer_id, item_id, items!inner(id,title,price,owner_id)"
+        )
+        .in("item_id", myItemIds);
+
+      if (error) {
+        console.error("Incoming requests error:", error);
+      } else {
+        incoming = data;
+      }
+    }
 
     setMyRequests(myReqs || []);
     setIncomingRequests(incoming || []);
   };
 
+
   const handleRequestToBuy = async (itemId) => {
     const { error } = await supabase
       .from("requests")
       .insert([{ buyer_id: user.id, item_id: itemId, status: "pending" }]);
-    if (error) return alert("Error: " + error.message);
+
+    if (error) {
+      alert("Error: " + error.message);
+      return;
+    }
+
     alert("Request sent to owner!");
+
     await supabase.rpc("increment_points", { uid: user.id, pts: 5 });
+
+    // ✅ ADD THIS LINE
+    fetchRequests(items, user);
+
     fetchLeaderboard();
   };
+
 
   const updateRequestStatus = async (id, status) => {
     const { error } = await supabase
