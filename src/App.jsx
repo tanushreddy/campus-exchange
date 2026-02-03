@@ -7,6 +7,7 @@ import AddItemModal from "./components/AddItemModal";
 
 export default function App() {
   const navigate = useNavigate();
+  const [checkingAuth, setCheckingAuth] = useState(true);
   const [user, setUser] = useState(null);
   const [items, setItems] = useState([]);
   const [myItems, setMyItems] = useState([]);
@@ -18,21 +19,22 @@ export default function App() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const { data: authListener } = supabase.auth.onAuthStateChange(
-      (_event, session) => {
-        if (!session) {
-          navigate("/login");
-        } else {
-          setUser(session.user);
-          fetchItems(session.user);
-        }
-      }
-    );
+    const checkSession = async () => {
+      const { data } = await supabase.auth.getSession();
 
-    return () => {
-      authListener.subscription.unsubscribe();
+      if (!data.session) {
+        navigate("/login");
+      } else {
+        setUser(data.session.user);
+        fetchItems(data.session.user);
+      }
+
+      setCheckingAuth(false);
     };
+
+    checkSession();
   }, []);
+
 
 
   const fetchItems = async (currentUser) => {
@@ -143,6 +145,14 @@ export default function App() {
     await supabase.auth.signOut();
     navigate("/login");
   };
+  if (checkingAuth) {
+    return (
+      <div style={{ textAlign: "center", marginTop: "40vh" }}>
+        Checking session...
+      </div>
+    );
+  }
+
 
   if (loading)
     return <div style={{ textAlign: "center", marginTop: "40vh" }}>Loading...</div>;
